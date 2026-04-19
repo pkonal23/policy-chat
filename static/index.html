@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UPES AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="magic-glow"></div>
+    
+    <header class="minimal-header">
+        <div class="logo">UPES</div>
+        <div class="status">COE: AI</div>
+    </header>
+
+    <main class="chat-viewport" id="chat-box">
+        <div class="startup-hero" id="hero">
+            <h1 class="magic-text">What are you looking for?</h1>
+            <p>Intelligence across all UPES policies.</p>
+            <div class="suggestions">
+                <button class="sugg-btn" data-q="What is the semester break policy?">Semester Breaks</button>
+                <button class="sugg-btn" data-q="Who is an advanced learner?">Advanced Learners</button>
+                <button class="sugg-btn" data-q="Explain the bell curve grading">Bell Curve System</button>
+            </div>
+        </div>
+        <div class="spacer"></div>
+    </main>
+
+    <div class="input-zone">
+        <form id="chat-form" class="floating-input">
+            <input type="text" id="user-input" placeholder="Ask a question..." autocomplete="off" required>
+            <button type="submit" id="send-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+        </form>
+        <div class="disclaimer">Powered by UPES Centre of Excellence AI.</div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
