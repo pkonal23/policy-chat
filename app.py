@@ -231,9 +231,15 @@ Reply with ONLY a JSON object (no markdown, no explanation, no <think> tags):
         relevant_content = "No relevant context found in document tree."
 
     # ── STEP 2: Answer Generation ─────────────────────────────────────
-    answer_prompt = f"""You are a knowledgeable UPES policy assistant. Answer based ONLY on the provided context.
-If the answer is not in the context, say so clearly.
-Always cite page numbers and section titles. Use Markdown formatting.
+    answer_prompt = f"""You are a UPES policy expert. Answer the question directly and confidently.
+
+Rules:
+- ALWAYS respond in English only. Never use Chinese, Hindi, or any other language — not even a single word or character.
+- NEVER say "Based on the provided context", "Based on the policy documents", "According to the policy", or any similar preamble. Just answer directly.
+- NEVER mention "policy documents", "the provided context", "the documents", or anything that references your source material. Speak as a knowledgeable expert, not as a system reading files.
+- Do NOT include inline references like "(Section 7.6, Page 12)". No parenthetical citations.
+- If the question is outside UPES policy scope, respond in exactly ONE casual sentence (e.g. "That's outside what I cover — I only handle UPES academic policies."). Do not elaborate.
+- Use clear Markdown formatting with headers and bullets where helpful.
 
 Question: {query}
 
@@ -244,7 +250,7 @@ Context:
         ans_res = await client.chat.completions.create(
             model="MiniMax-M2.5",
             messages=[
-                {"role": "system", "content": "You are a helpful university policy expert. Give clear, well-structured answers with citations."},
+                {"role": "system", "content": "You are a direct UPES policy expert assistant. English only — never use any other language. Never say 'policy documents', 'provided context', 'the documents', or reference your source material in any way. Speak as an expert, not as a system. For questions outside UPES academic policy scope, reply in exactly one short casual sentence. No inline citations like (Section X.X). Use Markdown."},
                 {"role": "user", "content": answer_prompt}
             ],
             temperature=req.temperature,

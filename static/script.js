@@ -86,8 +86,10 @@ form.addEventListener("submit", async (e) => {
 });
 
 function renderAnswer(container, { answer, thinking, retrieved_nodes }) {
-    let html = "";
+    // Answer first
+    let html = `<div class="ai-answer">${marked.parse(answer)}</div>`;
 
+    // Reasoning expandable at the bottom
     if (thinking && thinking !== "No reasoning provided.") {
         const nodesHtml = (retrieved_nodes || []).map(n =>
             `<span class="tag source-tag" style="cursor:pointer;" onclick="openSourceModal(this)" data-title="Page ${n.page_index}: ${escapeHtml(n.title)}" data-text="${escapeHtml(n.text || '')}">Pg ${n.page_index} : ${n.title}</span>`
@@ -97,17 +99,14 @@ function renderAnswer(container, { answer, thinking, retrieved_nodes }) {
         <div class="ai-reasoning">
             <button class="rsn-btn" onclick="toggleRsn(this)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-                View vectorless reasoning
+                View sources
             </button>
             <div class="rsn-content">
-                <p>${escapeHtml(thinking)}</p>
                 ${nodesHtml ? `<div class="tags-row">${nodesHtml}</div>` : ""}
             </div>
         </div>`;
     }
 
-    html += `<div class="ai-answer">${marked.parse(answer)}</div>`;
-    
     const ansContainer = document.createElement('div');
     ansContainer.innerHTML = html;
     container.appendChild(ansContainer);
