@@ -83,6 +83,66 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.5
 
 
+async def rewrite_query(original_query: str) -> str:
+    """Rewrite user's natural language into formal academic policy terminology for better tree search."""
+    try:
+        res = await client.chat.completions.create(
+            model="MiniMax-M2.5",
+            messages=[
+                {"role": "system", "content": (
+                    "You rewrite informal student questions into formal academic policy search queries. "
+                    "Output ONLY the rewritten query, nothing else — no quotes, no explanation. "
+                    "Keep it concise (1-2 sentences). Map informal terms to formal policy terms. Examples: "
+                    "'skip a year' → 'semester break / study leave / enrollment gap', "
+                    "'kicked out' → 'dismissal / rustication / expulsion', "
+                    "'fail a subject' → 'F grade / repeat course / backlog', "
+                    "'change branch' → 'lateral transfer / branch change / program migration', "
+                    "'attendance shortage' → 'attendance debarment / minimum attendance requirement'."
+                )},
+                {"role": "user", "content": original_query}
+            ],
+            temperature=0.1,
+            max_tokens=256
+        )
+        rewritten = res.choices[0].message.content.strip()
+        # Remove wrapping quotes if model adds them
+        rewritten = rewritten.strip('"').strip("'")
+        print(f"[Query Rewrite] '{original_query}' → '{rewritten}'")
+        return rewritten
+    except Exception as e:
+        print(f"[Query Rewrite] Failed ({e}), using original")
+        return original_query
+
+
+def is_uncertain_answer(answer: str) -> bool:
+    """Detect if the LLM's answer indicates it couldn't find the information in the provided context."""
+    uncertainty_phrases = [
+        "not found in the context",
+        "not mentioned in the",
+        "no information",
+        "not available in",
+        "does not contain",
+        "doesn't contain",
+        "not explicitly mentioned",
+        "not explicitly stated",
+        "cannot find",
+        "could not find",
+        "unable to find",
+        "not covered in",
+        "no relevant",
+        "i don't have enough",
+        "not addressed in",
+        "not specified in",
+        "the context does not",
+        "the provided context does not",
+        "based on the provided context, there is no",
+        "i cannot answer",
+        "not present in",
+    ]
+    lower = answer.lower()
+    return any(phrase in lower for phrase in uncertainty_phrases)
+
+
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     if not MINIMAX_API_KEY:
@@ -90,10 +150,14 @@ async def chat_endpoint(req: ChatRequest):
 
     query = req.query
 
+    # ── STEP 0: Query Rewriting (translate casual → policy terms) ──────
+    search_query = await rewrite_query(query)
+
     # ── STEP 1: Tree Search (Vectorless Reasoning) ────────────────────
     search_prompt = f"""You are a document retrieval assistant. Given a user question and a document tree, identify which nodes likely contain the answer.
 
-Question: {query}
+Question: {search_query}
+(Original phrasing: {query})
 
 Document Tree (id=node id, title=section title, page=page number, sub=children):
 {SLIM_TREE_JSON}
@@ -137,7 +201,8 @@ Reply with ONLY a JSON object (no markdown, no explanation, no <think> tags):
             retrieved_nodes.append({
                 "node_id": node.get("node_id", "?"),
                 "title": node.get("title", "?"),
-                "page_index": node.get("page_index", "?")
+                "page_index": node.get("page_index", "?"),
+                "text": node.get("text", "")
             })
             text = node.get("text", "")
             relevant_content_pieces.append(
@@ -176,6 +241,98 @@ Context:
     except Exception as e:
         print(f"Answer Generation Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate the answer. Please try again.")
+
+    # ── STEP 3: Aggressive Retry if answer is uncertain ────────────────
+    if is_uncertain_answer(final_answer) and SLIM_TREE_JSON:
+        print("[Retry] Answer was uncertain, running aggressive broad search...")
+
+        broad_search_prompt = f"""You are a document retrieval assistant performing a BROAD, AGGRESSIVE search.
+The previous precise search FAILED to find relevant content for this question.
+Now cast a WIDE net — include parent sections, definition sections, general rules, appendices, and anything tangentially related.
+
+Question: {search_query}
+(Original phrasing: {query})
+
+Document Tree:
+{SLIM_TREE_JSON}
+
+Return MORE nodes than you normally would. Include entire parent branches if unsure.
+Reply with ONLY a JSON object (no markdown, no explanation, no <think> tags):
+{{"thinking": "broad reasoning about where else this could be", "node_list": ["id1", "id2", ...]}}"""
+
+        try:
+            retry_search_res = await client.chat.completions.create(
+                model="MiniMax-M2.5",
+                messages=[
+                    {"role": "system", "content": "You are a precise JSON-only assistant. Never use <think> tags. Output raw JSON only. Be AGGRESSIVE — return more nodes rather than fewer."},
+                    {"role": "user", "content": broad_search_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=2048
+            )
+
+            retry_raw = retry_search_res.choices[0].message.content or ""
+            print(f"[Retry] Broad search raw ({len(retry_raw)} chars): {retry_raw[:200]}...")
+            retry_result = extract_json(retry_raw)
+            retry_node_ids = retry_result.get("node_list", [])
+
+            # Merge with original nodes, deduplicating while preserving order
+            all_node_ids = list(dict.fromkeys(node_list + retry_node_ids))
+            print(f"[Retry] Merged node count: {len(node_list)} original + {len(retry_node_ids)} broad → {len(all_node_ids)} unique")
+
+            # Re-retrieve with the expanded node set
+            retry_retrieved_nodes = []
+            retry_content_pieces = []
+            for nid in all_node_ids:
+                if nid in NODE_MAP:
+                    n = NODE_MAP[nid]
+                    retry_retrieved_nodes.append({
+                        "node_id": n.get("node_id", "?"),
+                        "title": n.get("title", "?"),
+                        "page_index": n.get("page_index", "?"),
+                        "text": n.get("text", "")
+                    })
+                    retry_content_pieces.append(
+                        f"[Page {n.get('page_index', '?')}] {n.get('title', '')}\n{n.get('text', '')}"
+                    )
+
+            retry_context = "\n\n---\n\n".join(retry_content_pieces)
+
+            if retry_context.strip():
+                retry_answer_prompt = f"""You are a knowledgeable UPES policy assistant. Answer based ONLY on the provided context.
+If the answer is not in the context, say so clearly.
+Always cite page numbers and section titles. Use Markdown formatting.
+
+Question: {query}
+
+Context:
+{retry_context}"""
+
+                retry_ans_res = await client.chat.completions.create(
+                    model="MiniMax-M2.5",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful university policy expert. Give clear, well-structured answers with citations."},
+                        {"role": "user", "content": retry_answer_prompt}
+                    ],
+                    temperature=req.temperature,
+                    max_tokens=2048
+                )
+
+                retry_answer = retry_ans_res.choices[0].message.content or ""
+                retry_answer = re.sub(r'<think>.*?</think>', '', retry_answer, flags=re.DOTALL).strip()
+
+                # Use retry answer only if it's actually better (not still uncertain)
+                if not is_uncertain_answer(retry_answer):
+                    final_answer = retry_answer
+                    retrieved_nodes = retry_retrieved_nodes
+                    thinking = thinking + " → [Deep Search: broadened scope found additional context]"
+                    print("[Retry] ✓ Better answer found with broad search.")
+                else:
+                    thinking = thinking + " → [Deep Search: even broad search could not locate answer]"
+                    print("[Retry] ✗ Broad search also failed.")
+
+        except Exception as e:
+            print(f"[Retry] Error during broad search: {e}")
 
     return {
         "answer": final_answer,

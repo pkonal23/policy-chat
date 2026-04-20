@@ -32,8 +32,32 @@ form.addEventListener("submit", async (e) => {
     // 2. Loading State (Magic Spinner)
     const loadingEl = document.createElement("div");
     loadingEl.className = "magic-spinner";
-    loadingEl.innerHTML = "<div class='spinner-ring'></div> Searching knowledge base...";
+    const magicTexts = [
+        "Thinking...",
+        "Reading...",
+        "Searching...",
+        "Analyzing...",
+        "Synthesizing..."
+    ];
+    let magicIdx = 0;
+    loadingEl.innerHTML = `<div class='spinner-ring'></div> <span class="magic-dynamic-text" style="transition: opacity 0.3s">${magicTexts[magicIdx]}</span>`;
     turnEl.appendChild(loadingEl);
+    
+    const magicInterval = setInterval(() => {
+        if (magicIdx >= magicTexts.length - 1) {
+            clearInterval(magicInterval);
+            return;
+        }
+        magicIdx++;
+        const txtSpan = loadingEl.querySelector('.magic-dynamic-text');
+        if(txtSpan) {
+            txtSpan.style.opacity = 0;
+            setTimeout(() => {
+                txtSpan.textContent = magicTexts[magicIdx];
+                txtSpan.style.opacity = 1;
+            }, 300);
+        }
+    }, 2400);
     
     chatBox.insertBefore(turnEl, chatBox.lastElementChild); // insert before spacer
     scrollBottom();
@@ -46,6 +70,7 @@ form.addEventListener("submit", async (e) => {
             body: JSON.stringify({ query })
         });
         const data = await res.json();
+        clearInterval(magicInterval);
         loadingEl.remove();
 
         if (res.ok) {
@@ -54,6 +79,7 @@ form.addEventListener("submit", async (e) => {
             renderAnswer(turnEl, { answer: `**Error:** ${data.detail || "Request failed."}`, thinking: "", retrieved_nodes: [] });
         }
     } catch {
+        clearInterval(magicInterval);
         loadingEl.remove();
         renderAnswer(turnEl, { answer: "Connection error. Is the server running?", thinking: "", retrieved_nodes: [] });
     }
@@ -64,7 +90,7 @@ function renderAnswer(container, { answer, thinking, retrieved_nodes }) {
 
     if (thinking && thinking !== "No reasoning provided.") {
         const nodesHtml = (retrieved_nodes || []).map(n =>
-            `<span class="tag">Pg ${n.page_index} : ${n.title}</span>`
+            `<span class="tag source-tag" style="cursor:pointer;" onclick="openSourceModal(this)" data-title="Page ${n.page_index}: ${escapeHtml(n.title)}" data-text="${escapeHtml(n.text || '')}">Pg ${n.page_index} : ${n.title}</span>`
         ).join("");
 
         html += `
@@ -100,4 +126,35 @@ function scrollBottom() {
 
 function escapeHtml(str) {
     return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+window.openSourceModal = function(el) {
+    const title = el.getAttribute("data-title");
+    const rawText = el.getAttribute("data-text");
+    const modal = document.getElementById("source-modal");
+    const titleEl = document.getElementById("modal-title");
+    const bodyEl = document.getElementById("modal-text");
+    
+    const turnEl = el.closest(".turn-container");
+    const queryEl = turnEl ? turnEl.querySelector(".user-query") : null;
+    const query = queryEl ? queryEl.textContent : "";
+    
+    const ignoreWords = ["what", "when", "where", "which", "who", "how", "why", "this", "that", "these", "those", "does", "policy", "about", "explain"];
+    const rawWords = query.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
+    const keywords = [...new Set(rawWords.filter(w => w.length > 3 && !ignoreWords.includes(w)))];
+    
+    let htmlContent = marked.parse(rawText || "No source text available.");
+    
+    keywords.forEach(word => {
+        const regex = new RegExp(`\\b(${word})\\b(?![^<]*>)`, 'gi');
+        htmlContent = htmlContent.replace(regex, '<mark>$1</mark>');
+    });
+    
+    titleEl.textContent = title;
+    bodyEl.innerHTML = htmlContent;
+    modal.style.display = "flex";
+}
+
+window.closeSourceModal = function() {
+    document.getElementById("source-modal").style.display = "none";
 }
