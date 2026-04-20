@@ -31,12 +31,22 @@ try:
 except Exception as e:
     print(f"Warning: Index files not found ({e}). Run indexer.py first.")
 
+# ── Build full-page index (groups ALL node text by page number) ───────────
+PAGE_INDEX = {}
+for _nid, _node in NODE_MAP.items():
+    _page = _node.get("page_index", "?")
+    _text = _node.get("text", "")
+    _title = _node.get("title", "")
+    if _page not in PAGE_INDEX:
+        PAGE_INDEX[_page] = []
+    PAGE_INDEX[_page].append({"node_id": _nid, "title": _title, "text": _text})
+print(f"Page index: {len(PAGE_INDEX)} pages")
+
 
 def build_lightweight_tree(node):
     """
-    Recursively build a minimal tree containing ONLY node_id, title, and page_index.
-    Strips text, summary, and all heavy fields. Handles both 'children' and 'nodes' keys,
-    as well as bare lists.
+    Recursively build a minimal tree containing ONLY node_id, title, page_index,
+    and optional summary (if enriched). Handles both 'children' and 'nodes' keys.
     """
     if isinstance(node, list):
         return [build_lightweight_tree(item) for item in node]
@@ -44,11 +54,18 @@ def build_lightweight_tree(node):
     if not isinstance(node, dict):
         return node
 
+    node_id = node.get("node_id", "")
     slim = {
-        "id": node.get("node_id", ""),
+        "id": node_id,
         "title": node.get("title", ""),
         "page": node.get("page_index", ""),
     }
+
+    # Pull summary from NODE_MAP if it was enriched (not stored in tree.json)
+    if node_id and node_id in NODE_MAP:
+        summary = NODE_MAP[node_id].get("summary", "")
+        if summary:
+            slim["summary"] = summary
 
     # Recurse into whichever child key exists
     kids = node.get("children") or node.get("nodes")
@@ -62,6 +79,10 @@ def build_lightweight_tree(node):
 SLIM_TREE = build_lightweight_tree(TREE) if TREE else {}
 SLIM_TREE_JSON = json.dumps(SLIM_TREE, indent=1)
 print(f"Slim tree size: {len(SLIM_TREE_JSON)} chars")
+
+# Pre-compute all section titles for query rewriting context
+ALL_TITLES = "\n".join(f"- {n.get('title', '')}" for n in NODE_MAP.values() if n.get('title'))
+print(f"Titles index: {len(ALL_TITLES)} chars")
 
 
 def extract_json(text: str) -> dict:
@@ -78,71 +99,61 @@ def extract_json(text: str) -> dict:
     raise ValueError(f"No JSON found in: {text[:300]}")
 
 
-class ChatRequest(BaseModel):
-    query: str
-    temperature: Optional[float] = 0.5
-
-
-async def rewrite_query(original_query: str) -> str:
-    """Rewrite user's natural language into formal academic policy terminology for better tree search."""
+async def rewrite_query(raw_query: str) -> str:
+    """Use LLM to expand the user query with policy-specific terminology.
+    Returns the raw LLM output with ZERO parsing — even if wrapped in <think> tags,
+    the downstream tree search LLM will still understand the enriched keywords."""
     try:
         res = await client.chat.completions.create(
             model="MiniMax-M2.5",
             messages=[
-                {"role": "system", "content": (
-                    "You rewrite informal student questions into formal academic policy search queries. "
-                    "Output ONLY the rewritten query, nothing else — no quotes, no explanation. "
-                    "Keep it concise (1-2 sentences). Map informal terms to formal policy terms. Examples: "
-                    "'skip a year' → 'semester break / study leave / enrollment gap', "
-                    "'kicked out' → 'dismissal / rustication / expulsion', "
-                    "'fail a subject' → 'F grade / repeat course / backlog', "
-                    "'change branch' → 'lateral transfer / branch change / program migration', "
-                    "'attendance shortage' → 'attendance debarment / minimum attendance requirement'."
-                )},
-                {"role": "user", "content": original_query}
+                {"role": "system", "content": "You rewrite student questions into formal policy search queries. You are given the actual section titles from the university policy manual. Output relevant keywords and matching section titles that would help find the answer. Just output the keywords, nothing else."},
+                {"role": "user", "content": f"Student question: {raw_query}\n\nAvailable policy sections:\n{ALL_TITLES}\n\nRelevant search keywords and matching section titles:"}
             ],
-            temperature=0.1,
-            max_tokens=256
+            temperature=0.0,
+            max_tokens=150
         )
-        rewritten = res.choices[0].message.content.strip()
-        # Strip <think> tags that MiniMax sometimes injects despite instructions
-        rewritten = re.sub(r'<think>.*?</think>', '', rewritten, flags=re.DOTALL).strip()
-        # Remove wrapping quotes if model adds them
-        rewritten = rewritten.strip('"').strip("'")
-        print(f"[Query Rewrite] '{original_query}' → '{rewritten}'")
+        # NO PARSING — use raw output as-is, think tags and all
+        rewritten = res.choices[0].message.content.strip() or raw_query
+        print(f"[Query Rewrite] '{raw_query}' → '{rewritten[:120]}...'")
         return rewritten
     except Exception as e:
-        print(f"[Query Rewrite] Failed ({e}), using original")
-        return original_query
+        print(f"[Query Rewrite] Failed ({e}), using original query")
+        return raw_query
 
 
-def is_uncertain_answer(answer: str) -> bool:
-    """Detect if the LLM's answer indicates it couldn't find the information in the provided context."""
-    uncertainty_phrases = [
-        "not found in the context",
-        "not mentioned in the",
-        "no information",
-        "not available in",
-        "does not contain",
-        "doesn't contain",
-        "not explicitly mentioned",
-        "not explicitly stated",
-        "cannot find",
-        "could not find",
-        "unable to find",
-        "not covered in",
-        "no relevant",
-        "i don't have enough",
-        "not addressed in",
-        "not specified in",
-        "the context does not",
-        "the provided context does not",
-        "based on the provided context, there is no",
-        "i cannot answer",
-        "not present in",
-    ]
-    lower = answer.lower()
-    return any(phrase in lower for phrase in uncertainty_phrases)
+def enrich_with_page_context(node_list: list, existing_pieces: list) -> list:
+    """For every page touched by retrieved nodes, pull ALL sibling content from that page."""
+    seen_node_ids = {nid for nid in node_list}
+    pages_touched = set()
+    for nid in node_list:
+        if nid in NODE_MAP:
+            pages_touched.add(NODE_MAP[nid].get("page_index", "?"))
+
+    enriched_pieces = list(existing_pieces)  # keep originals
+    extra_nodes = []
+    for page in pages_touched:
+        if page in PAGE_INDEX:
+            for sibling in PAGE_INDEX[page]:
+                if sibling["node_id"] not in seen_node_ids and sibling["text"].strip():
+                    seen_node_ids.add(sibling["node_id"])
+                    enriched_pieces.append(
+                        f"[Page {page}] {sibling['title']}\n{sibling['text']}"
+                    )
+                    extra_nodes.append({
+                        "node_id": sibling["node_id"],
+                        "title": sibling["title"],
+                        "page_index": page,
+                        "text": sibling["text"]
+                    })
+    if extra_nodes:
+        print(f"[Page Enrichment] Added {len(extra_nodes)} sibling nodes from {len(pages_touched)} pages")
+    return enriched_pieces, extra_nodes
+
+
+class ChatRequest(BaseModel):
+    query: str
+    temperature: Optional[float] = 0.5
 
 
 @app.post("/chat")
@@ -152,14 +163,14 @@ async def chat_endpoint(req: ChatRequest):
 
     query = req.query
 
-    # ── STEP 0: Query Rewriting (translate casual → policy terms) ──────
-    search_query = await rewrite_query(query)
+    # ── STEP 0: Query Rewriting ───────────────────────────────────────
+    rewritten_query = await rewrite_query(query)
 
     # ── STEP 1: Tree Search (Vectorless Reasoning) ────────────────────
     search_prompt = f"""You are a document retrieval assistant. Given a user question and a document tree, identify which nodes likely contain the answer.
 
-Question: {search_query}
-(Original phrasing: {query})
+Original Question: {query}
+Search Keywords: {rewritten_query}
 
 Document Tree (id=node id, title=section title, page=page number, sub=children):
 {SLIM_TREE_JSON}
@@ -211,7 +222,11 @@ Reply with ONLY a JSON object (no markdown, no explanation, no <think> tags):
                 f"[Page {node.get('page_index', '?')}] {node.get('title', '')}\n{text}"
             )
 
-    relevant_content = "\n\n---\n\n".join(relevant_content_pieces)
+    # ── Enrich with full page context (sibling nodes from same pages) ─
+    enriched_pieces, extra_nodes = enrich_with_page_context(node_list, relevant_content_pieces)
+    retrieved_nodes.extend(extra_nodes)
+
+    relevant_content = "\n\n---\n\n".join(enriched_pieces)
     if not relevant_content.strip():
         relevant_content = "No relevant context found in document tree."
 
@@ -243,98 +258,6 @@ Context:
     except Exception as e:
         print(f"Answer Generation Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate the answer. Please try again.")
-
-    # ── STEP 3: Aggressive Retry if answer is uncertain ────────────────
-    if is_uncertain_answer(final_answer) and SLIM_TREE_JSON:
-        print("[Retry] Answer was uncertain, running aggressive broad search...")
-
-        broad_search_prompt = f"""You are a document retrieval assistant performing a BROAD, AGGRESSIVE search.
-The previous precise search FAILED to find relevant content for this question.
-Now cast a WIDE net — include parent sections, definition sections, general rules, appendices, and anything tangentially related.
-
-Question: {search_query}
-(Original phrasing: {query})
-
-Document Tree:
-{SLIM_TREE_JSON}
-
-Return MORE nodes than you normally would. Include entire parent branches if unsure.
-Reply with ONLY a JSON object (no markdown, no explanation, no <think> tags):
-{{"thinking": "broad reasoning about where else this could be", "node_list": ["id1", "id2", ...]}}"""
-
-        try:
-            retry_search_res = await client.chat.completions.create(
-                model="MiniMax-M2.5",
-                messages=[
-                    {"role": "system", "content": "You are a precise JSON-only assistant. Never use <think> tags. Output raw JSON only. Be AGGRESSIVE — return more nodes rather than fewer."},
-                    {"role": "user", "content": broad_search_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=2048
-            )
-
-            retry_raw = retry_search_res.choices[0].message.content or ""
-            print(f"[Retry] Broad search raw ({len(retry_raw)} chars): {retry_raw[:200]}...")
-            retry_result = extract_json(retry_raw)
-            retry_node_ids = retry_result.get("node_list", [])
-
-            # Merge with original nodes, deduplicating while preserving order
-            all_node_ids = list(dict.fromkeys(node_list + retry_node_ids))
-            print(f"[Retry] Merged node count: {len(node_list)} original + {len(retry_node_ids)} broad → {len(all_node_ids)} unique")
-
-            # Re-retrieve with the expanded node set
-            retry_retrieved_nodes = []
-            retry_content_pieces = []
-            for nid in all_node_ids:
-                if nid in NODE_MAP:
-                    n = NODE_MAP[nid]
-                    retry_retrieved_nodes.append({
-                        "node_id": n.get("node_id", "?"),
-                        "title": n.get("title", "?"),
-                        "page_index": n.get("page_index", "?"),
-                        "text": n.get("text", "")
-                    })
-                    retry_content_pieces.append(
-                        f"[Page {n.get('page_index', '?')}] {n.get('title', '')}\n{n.get('text', '')}"
-                    )
-
-            retry_context = "\n\n---\n\n".join(retry_content_pieces)
-
-            if retry_context.strip():
-                retry_answer_prompt = f"""You are a knowledgeable UPES policy assistant. Answer based ONLY on the provided context.
-If the answer is not in the context, say so clearly.
-Always cite page numbers and section titles. Use Markdown formatting.
-
-Question: {query}
-
-Context:
-{retry_context}"""
-
-                retry_ans_res = await client.chat.completions.create(
-                    model="MiniMax-M2.5",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful university policy expert. Give clear, well-structured answers with citations."},
-                        {"role": "user", "content": retry_answer_prompt}
-                    ],
-                    temperature=req.temperature,
-                    max_tokens=2048
-                )
-
-                retry_answer = retry_ans_res.choices[0].message.content or ""
-                retry_answer = re.sub(r'<think>.*?</think>', '', retry_answer, flags=re.DOTALL).strip()
-
-                # Use retry answer only if it's actually better (not still uncertain)
-                if not is_uncertain_answer(retry_answer):
-                    final_answer = retry_answer
-                    retrieved_nodes = retry_retrieved_nodes
-                    thinking = thinking + " → [Deep Search: broadened scope found additional context]"
-                    print("[Retry] ✓ Better answer found with broad search.")
-                else:
-                    thinking = thinking + " → [Deep Search: even broad search could not locate answer]"
-                    print("[Retry] ✗ Broad search also failed.")
-
-        except Exception as e:
-            print(f"[Retry] Error during broad search: {e}")
 
     return {
         "answer": final_answer,
