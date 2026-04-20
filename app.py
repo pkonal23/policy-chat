@@ -105,6 +105,8 @@ async def rewrite_query(original_query: str) -> str:
             max_tokens=256
         )
         rewritten = res.choices[0].message.content.strip()
+        # Strip <think> tags that MiniMax sometimes injects despite instructions
+        rewritten = re.sub(r'<think>.*?</think>', '', rewritten, flags=re.DOTALL).strip()
         # Remove wrapping quotes if model adds them
         rewritten = rewritten.strip('"').strip("'")
         print(f"[Query Rewrite] '{original_query}' → '{rewritten}'")
